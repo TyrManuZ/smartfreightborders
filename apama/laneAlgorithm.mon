@@ -1,0 +1,256 @@
+/** Basic event definitions for working with Cumulocity IoT */
+using com.apama.cumulocity.ManagedObject;
+using com.apama.cumulocity.FindManagedObject;
+using com.apama.cumulocity.FindManagedObjectResponse;
+using com.apama.cumulocity.FindManagedObjectResponseAck;
+
+using com.apama.cumulocity.Measurement;
+using com.apama.cumulocity.MeasurementValue;
+using com.apama.cumulocity.FindMeasurement;
+using com.apama.cumulocity.FindMeasurementResponse;
+using com.apama.cumulocity.FindMeasurementResponseAck;
+
+using com.apama.cumulocity.Alarm;
+using com.apama.cumulocity.FindAlarm;
+using com.apama.cumulocity.FindAlarmResponse;
+using com.apama.cumulocity.FindAlarmResponseAck;
+
+using com.apama.cumulocity.Event;
+using com.apama.cumulocity.FindEvent;
+using com.apama.cumulocity.FindEventResponse;
+using com.apama.cumulocity.FindEventResponseAck;
+
+using com.apama.cumulocity.Operation;
+using com.apama.cumulocity.FindOperation;
+using com.apama.cumulocity.FindOperationResponse;
+using com.apama.cumulocity.FindOperationResponseAck;
+
+/** Miscellaneous utilities */
+using com.apama.cumulocity.Util;
+using com.apama.util.AnyExtractor;
+
+/** An object that holds query parameters. */
+event ManagedObjectFilter {
+
+	/** Param to indicate how many entries of the collection
+	 *  are to be retrieved from Cumulocity IoT.
+	 */
+	constant string PAGE_SIZE := "pageSize";
+
+	/** Param to search for managedObjects based on the fragmentType. */
+	constant string FRAGMENT_TYPE := "fragmentType";
+
+	/** Param to search for managedObjects based on the type. */
+	constant string TYPE := "type";
+
+	/** Create and return a new ManagedObjectFilter object. */
+	static action init() returns ManagedObjectFilter {
+		return new ManagedObjectFilter;
+	}
+
+	/** Request with pageSize. */
+	action withPageSize(integer pageSize) returns ManagedObjectFilter {
+		return addParam(PAGE_SIZE, pageSize.toString());
+	}
+
+	/** Filter based on fragmentType. */
+	action byFragmentType(string fragmentType) returns ManagedObjectFilter {
+		return addParam(FRAGMENT_TYPE, fragmentType);
+	}
+
+	/** Filter based on deviceId. */
+	action byId(string id) returns ManagedObjectFilter {
+		return addParam("ids", id);
+	}
+
+	/** Filter based on Type. */
+	action byType(string type) returns ManagedObjectFilter {
+		return addParam(TYPE, type);
+	}
+
+	/** Add a query parameter. */
+	action addParam(string paramName, string paramValue)
+			returns ManagedObjectFilter {
+		params.add(paramName, paramValue);
+		return self;
+	}
+
+	/** Return query parameters. */
+	action getParameters() returns dictionary<string, string> {
+		return params;
+	}
+
+	/** Query parameters. */
+	dictionary<string, string> params;
+}
+
+/** Helper to query for managedObjects. */
+event ManagedObjectLookupHelper {
+
+	/** Callback for successful responses. */
+	action<integer, ManagedObject, Event> responseCallback;
+
+	/** Callback for completion acknowledgement. */
+	action<integer> responseCompletedCallback;
+
+	/** Cumulocity Event from trigger. */
+	Event cumulocityEvent;
+
+	/** Create and return a new ManagedObjectLookupHelper object. */
+	static action init() returns ManagedObjectLookupHelper {
+		return new ManagedObjectLookupHelper;
+	}
+
+	/** Register query response callback. */
+	action withEvent(Event c8yEvent)
+			returns ManagedObjectLookupHelper {
+		cumulocityEvent := c8yEvent;
+		return self;
+	}
+
+	/** Register query response callback. */
+	action withResponseCallback(action<integer, ManagedObject, Event> responseCb)
+			returns ManagedObjectLookupHelper {
+		responseCallback := responseCb;
+		return self;
+	}
+
+	/** Register query completed callback. */
+	action withResponseCompletedCallback(action<integer> responseCompletedCb)
+			returns ManagedObjectLookupHelper {
+		responseCompletedCallback := responseCompletedCb;
+		return self;
+	}
+
+	/** Simple request without any params to fetch available managedObjects. */
+	action get() returns integer {
+		return getWithFilter(ManagedObjectFilter.init());
+	}
+
+	/** Query for managedObjects based on a filter. */
+	action getWithFilter(ManagedObjectFilter filter) returns integer {
+
+		/** Subscribe to FindManagedObjectResponse.CHANNEL to listen for
+		 *  responses.
+		 */
+		monitor.subscribe(FindManagedObjectResponse.CHANNEL);
+
+		/** Unique request identifier. */
+		integer reqId := integer.getUnique();
+
+		/** Listen for matching responses. */
+		on all FindManagedObjectResponse(reqId=reqId) as resp
+		and not FindManagedObjectResponseAck(reqId=reqId) {
+			ifpresent responseCallback {
+				responseCallback(reqId, resp.managedObject, cumulocityEvent);
+			}
+		}
+
+		/** Listen for request completed acknowledgement. */
+		on FindManagedObjectResponseAck(reqId=reqId) {
+			monitor.unsubscribe(FindManagedObjectResponse.CHANNEL);
+			ifpresent responseCompletedCallback {
+				responseCompletedCallback(reqId);
+			}
+		}
+
+		/** Send request to find available managedObjects. */
+		FindManagedObject findManagedObject := new FindManagedObject;
+		findManagedObject.reqId := reqId;
+		findManagedObject.params := filter.getParameters();
+		send findManagedObject to FindManagedObject.CHANNEL;
+
+		return reqId;
+	}
+}
+
+/**
+* Query for ManagedObject based on fragmentType
+*/
+monitor SmartFreightBorder {
+
+	constant string FRAGMENT_TYPE := "c8y_IsDevice";
+
+	/* TODO: workaround for keeping the event data accessible after MO is grabbed */
+	string plate;
+
+	action onload() {
+		monitor.subscribe(Measurement.CHANNEL);
+		on all Event(type="c8y_PreRegisteredVehicle") as e {
+			handleEvent(e);
+		}
+		on all Event(type="c8y_UnregisteredVehicle") as e {
+			handleEvent(e);
+		}
+	}
+
+	action handleEvent(Event licensePlateEvent) {
+		ManagedObjectFilter filter := ManagedObjectFilter.init().byId("406");
+		integer reqId := ManagedObjectLookupHelper.init()
+						.withEvent(licensePlateEvent)
+						.withResponseCallback(assignVehicleToLane)
+						.withResponseCompletedCallback(queryCompleted)
+						.getWithFilter(filter);
+	}
+
+	/** Logic to prioritize the vehicles */
+	action assignVehicleToLane(integer reqId, ManagedObject checkpoint, Event licensePlateEvent) {
+		dictionary<any,any> attrs := <dictionary <any,any> > licensePlateEvent.params.getOrDefault("c8y_LicenseInformation");
+		log(attrs.toString());
+		string plate := attrs.getOrDefault("plate").valueToString();
+		string priority := attrs.getOrDefault("priority").valueToString();
+		string phoneNumber := attrs.getOrDefault("phoneNumber").valueToString();
+		string freight := attrs.getOrDefault("freight").valueToString();
+		updateCheckpointLanes(plate, priority, checkpoint);
+	}
+
+	action updateCheckpointLanes(string licensePlate, string priority, ManagedObject checkpoint) {
+		// priority lanes
+		sequence<any> lane1 := <sequence <any> > checkpoint.params.getOrDefault("c8y_Lane1");
+		sequence<any> lane2 := <sequence <any> > checkpoint.params.getOrDefault("c8y_Lane2");
+		// standard lanes
+		sequence<any> lane3 := <sequence <any> > checkpoint.params.getOrDefault("c8y_Lane3");
+		sequence<any> lane4 := <sequence <any> > checkpoint.params.getOrDefault("c8y_Lane4");
+		if (priority = "high") {
+			if(lane1.size() <= lane2.size()) {
+				lane1.append(licensePlate);
+				checkpoint.params.add("c8y_Lane1", lane1);
+				send checkpoint to ManagedObject.UPDATE_CHANNEL;
+				createSmsAlarm("Please use lane 1", checkpoint.id);
+			} else {
+				lane2.append(licensePlate);
+				checkpoint.params.add("c8y_Lane2", lane2);
+				send checkpoint to ManagedObject.UPDATE_CHANNEL;
+				createSmsAlarm("Please use lane 2", checkpoint.id);
+			}
+		} else {
+			if(lane3.size() <= lane4.size()) {
+				lane3.append(licensePlate);
+				checkpoint.params.add("c8y_Lane3", lane3);
+				send checkpoint to ManagedObject.UPDATE_CHANNEL;
+				createSmsAlarm("Please use lane 3", checkpoint.id);
+			} else {
+				lane4.append(licensePlate);
+				checkpoint.params.add("c8y_Lane4", lane4);
+				send checkpoint to ManagedObject.UPDATE_CHANNEL;
+				createSmsAlarm("Please use lane 4", checkpoint.id);
+			}
+		}
+	}
+
+	action createSmsAlarm(string smsText, string source) {
+		Alarm alarm := new Alarm;
+		alarm.source := source;
+		alarm.time := currentTime;
+		alarm.text := smsText;
+		alarm.type := "c8y_LaneAssigned";
+		alarm.status := "ACTIVE";
+		alarm.severity := "MINOR";
+		send alarm to Alarm.CHANNEL;
+	}
+
+	/** Request completed acknowledgement. */
+	action queryCompleted(integer reqId) {
+		log "Find ManagedObject Request completed " + reqId.toString() at INFO;
+	}
+}
